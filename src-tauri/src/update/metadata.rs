@@ -1288,4 +1288,29 @@ mod tests {
         assert_eq!(compare_candidates(&pre, &stable), Ordering::Greater);
         assert!(candidate_is_newer_than("v2026.925.152547.旧", &pre));
     }
+
+    #[test]
+    fn fork_release_versions_order_between_upstream_releases() {
+        let candidate = |version: &str| ReleaseCandidate {
+            version: version.to_string(),
+            prerelease: false,
+            github_release_id: None,
+            published_at: None,
+            release_notes: String::new(),
+            release_page: String::new(),
+            assets: Vec::new(),
+        };
+        // Fork releases are tagged v<upstream base>.<run>.杂鱼.
+        let fork = candidate("v2026.1027.141040.5.杂鱼");
+        assert!(candidate_is_newer_than("v2026.1027.141040.杂鱼", &fork));
+        assert!(candidate_is_newer_than("v2026.1027.141040.0.杂鱼", &fork));
+        assert!(candidate_is_newer_than("v2026.1027.141040.4.杂鱼", &fork));
+        assert!(candidate_is_newer_than("0.0.0.5379d6f6f10284f1e5f5b7c65a99a24618b49a46", &fork));
+        assert!(!candidate_is_newer_than("v2026.1027.141040.5.杂鱼", &fork));
+        assert!(!candidate_is_newer_than("v2026.1028.10000.1.杂鱼", &fork));
+        assert!(candidate_is_newer_than(
+            "v2026.1027.141040.5.杂鱼",
+            &candidate("v2026.1028.10000.杂鱼")
+        ));
+    }
 }
