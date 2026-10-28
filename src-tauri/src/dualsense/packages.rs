@@ -195,7 +195,7 @@ pub(crate) fn validate_sidecar_package_manifest(
             && url.host_str() == Some("github.com")
             && url
                 .path()
-                .starts_with("/AlkaidLab/foundation-sunshine/releases/download/")
+                .starts_with(&crate::release_source::release_download_path_prefix())
             && url
                 .path_segments()
                 .and_then(Iterator::last)

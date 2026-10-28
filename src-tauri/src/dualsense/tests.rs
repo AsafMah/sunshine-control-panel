@@ -311,7 +311,8 @@ fn sidecar_package_manifest_requires_pinned_release_asset() {
         license: super::SIDECAR_PACKAGE_LICENSE.to_string(),
         asset_name: super::SIDECAR_PACKAGE_ASSET.to_string(),
         download_url: format!(
-            "https://github.com/AlkaidLab/foundation-sunshine/releases/download/v1/{}",
+            "https://github.com{}v1/{}",
+            crate::release_source::release_download_path_prefix(),
             super::SIDECAR_PACKAGE_ASSET
         ),
         sha256: "a".repeat(64),

@@ -25,6 +25,7 @@ mod moonlight_web;
 mod native_tools;
 mod power;
 mod proxy_server;
+mod release_source;
 mod rtss;
 mod rtss_frame_rates;
 mod perf;

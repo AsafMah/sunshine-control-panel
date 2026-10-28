@@ -1490,9 +1490,15 @@ fn validate_download_url(url: &str, expected_filename: Option<&str>) -> Result<(
     {
         return Err("下载地址必须是无凭据的 HTTPS 地址".to_string());
     }
+    let github_prefix = [
+        crate::release_source::owner(),
+        crate::release_source::repository(),
+        "releases",
+        "download",
+    ];
     let expected_prefix: &[&str] = match parsed.host_str() {
-        Some("github.com") => &["AlkaidLab", "foundation-sunshine", "releases", "download"],
-        Some("cnb.cool") => &[
+        Some("github.com") => &github_prefix,
+        Some("cnb.cool") if crate::release_source::official_mirrors_enabled() => &[
             "AlkaidLab",
             "foundation-sunshine-release",
             "-",
@@ -1967,46 +1973,34 @@ mod download_source_tests {
 
     #[test]
     fn download_url_requires_an_allowlisted_foundation_release_host() {
-        assert!(
-            validate_download_url(
-                "https://github.com/AlkaidLab/foundation-sunshine/releases/download/v1/setup.exe",
-                None,
-            )
-            .is_ok()
-        );
-        assert!(validate_download_url(
-            "https://cnb.cool/AlkaidLab/foundation-sunshine-release/-/releases/download/v1/setup.exe",
-            None,
-        )
-        .is_ok());
+        let prefix = crate::release_source::release_download_path_prefix();
+        let base = format!("https://github.com{prefix}");
+        let official = "https://github.com/AlkaidLab/foundation-sunshine/releases/download/v1/setup.exe";
+        let cnb = "https://cnb.cool/AlkaidLab/foundation-sunshine-release/-/releases/download/v1/setup.exe";
+        assert!(validate_download_url(&format!("{base}v1/setup.exe"), None).is_ok());
+        // Fork builds must not accept AlkaidLab assets or the AlkaidLab CNB mirror.
+        let mirrors = crate::release_source::official_mirrors_enabled();
+        assert_eq!(validate_download_url(cnb, None).is_ok(), mirrors);
+        assert_eq!(validate_download_url(official, None).is_ok(), mirrors);
 
         for invalid_url in [
-            "http://github.com/AlkaidLab/foundation-sunshine/releases/download/v1/setup.exe",
-            "https://github.com.example.invalid/AlkaidLab/foundation-sunshine/releases/download/v1/setup.exe",
-            "https://github.com/AlkaidLab/other/releases/download/v1/setup.exe",
-            "https://user:secret@github.com/AlkaidLab/foundation-sunshine/releases/download/v1/setup.exe",
-            "not a url",
+            format!("http://github.com{prefix}v1/setup.exe"),
+            format!("https://github.com.example.invalid{prefix}v1/setup.exe"),
+            format!(
+                "https://github.com/{}/other/releases/download/v1/setup.exe",
+                crate::release_source::owner()
+            ),
+            format!("******github.com{prefix}v1/setup.exe"),
+            "not a url".to_string(),
         ] {
             assert!(
-                validate_download_url(invalid_url, None).is_err(),
+                validate_download_url(&invalid_url, None).is_err(),
                 "unexpectedly accepted {invalid_url}"
             );
         }
 
-        assert!(
-            validate_download_url(
-                "https://github.com/AlkaidLab/foundation-sunshine/releases/download/v1/setup.exe",
-                Some("setup.exe"),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_download_url(
-                "https://github.com/AlkaidLab/foundation-sunshine/releases/download/v1/other.exe",
-                Some("setup.exe"),
-            )
-            .is_err()
-        );
+        assert!(validate_download_url(&format!("{base}v1/setup.exe"), Some("setup.exe")).is_ok());
+        assert!(validate_download_url(&format!("{base}v1/other.exe"), Some("setup.exe")).is_err());
     }
 
     #[test]

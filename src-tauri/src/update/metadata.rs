@@ -12,17 +12,15 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::github_download::DownloadCandidate;
+use crate::release_source;
 
 const METADATA_COM_URL: &str =
     "https://www.alkaidlab.com/release-metadata/foundation-sunshine.json";
 const METADATA_CN_URL: &str = "https://www.alkaidlab.cn/release-metadata/foundation-sunshine.json";
 const CNB_RELEASES_URL: &str = "https://cnb.cool/AlkaidLab/foundation-sunshine-release/-/releases";
-const GITHUB_LATEST_URL: &str =
-    "https://api.github.com/repos/AlkaidLab/foundation-sunshine/releases/latest";
-const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/AlkaidLab/foundation-sunshine/releases?per_page=30";
-const GITHUB_OWNER: &str = "AlkaidLab";
-const GITHUB_REPOSITORY: &str = "foundation-sunshine";
+// The CNB mirror is AlkaidLab-only; it is used only while
+// release_source::official_mirrors_enabled().
+const CNB_OWNER: &str = "AlkaidLab";
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_RELEASE_NOTES_BYTES: usize = 128 * 1024;
 const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -376,7 +374,7 @@ fn classify_asset_name(name: &str) -> Option<&'static str> {
 }
 
 fn encoded_release_page(tag: &str) -> String {
-    let mut url = Url::parse("https://github.com/AlkaidLab/foundation-sunshine/releases/tag")
+    let mut url = Url::parse(&format!("{}/releases/tag", release_source::github_repository_url()))
         .expect("built-in GitHub release URL must be valid");
     url.path_segments_mut()
         .expect("GitHub release URL must be a base URL")
@@ -385,8 +383,11 @@ fn encoded_release_page(tag: &str) -> String {
 }
 
 fn encoded_download_url(tag: &str, name: &str) -> String {
-    let mut url = Url::parse("https://github.com/AlkaidLab/foundation-sunshine/releases/download")
-        .expect("built-in GitHub download URL must be valid");
+    let mut url = Url::parse(&format!(
+        "{}/releases/download",
+        release_source::github_repository_url()
+    ))
+    .expect("built-in GitHub download URL must be valid");
     url.path_segments_mut()
         .expect("GitHub download URL must be a base URL")
         .push(tag)
@@ -447,8 +448,8 @@ fn github_release_download_tag(url: &str, name: &str) -> Result<String, String> 
         .ok_or_else(|| "组件下载地址缺少路径".to_string())?
         .collect::<Vec<_>>();
     if segments.len() != 6
-        || segments[0] != GITHUB_OWNER
-        || segments[1] != GITHUB_REPOSITORY
+        || segments[0] != release_source::owner()
+        || segments[1] != release_source::repository()
         || segments[2] != "releases"
         || segments[3] != "download"
         || decode_segment(segments[5])? != name
@@ -475,11 +476,17 @@ fn validate_release_download_url(url: &str, tag: &str, name: &str) -> Result<(),
         .ok_or_else(|| "下载地址缺少路径".to_string())?
         .collect::<Vec<_>>();
     let host = parsed.host_str().unwrap_or_default();
+    let github_prefix = [
+        release_source::owner(),
+        release_source::repository(),
+        "releases",
+        "download",
+    ];
     let expected_prefix = if host == "github.com" {
-        [GITHUB_OWNER, GITHUB_REPOSITORY, "releases", "download"].as_slice()
-    } else if host == "cnb.cool" {
+        github_prefix.as_slice()
+    } else if host == "cnb.cool" && release_source::official_mirrors_enabled() {
         [
-            GITHUB_OWNER,
+            CNB_OWNER,
             "foundation-sunshine-release",
             "-",
             "releases",
@@ -638,8 +645,8 @@ fn validate_github_release_page(url: &str, tag: &str) -> Result<(), String> {
         .ok_or_else(|| "GitHub release 页面路径无效".to_string())?
         .collect::<Vec<_>>();
     if segments.len() != 5
-        || segments[0] != GITHUB_OWNER
-        || segments[1] != GITHUB_REPOSITORY
+        || segments[0] != release_source::owner()
+        || segments[1] != release_source::repository()
         || segments[2] != "releases"
         || segments[3] != "tag"
         || decode_segment(segments[4])? != tag
@@ -738,13 +745,15 @@ async fn fetch_github_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T,
 
 async fn fetch_github_catalog(channel: UpdateChannel) -> Result<ReleaseCatalog, String> {
     let need_list = !matches!(channel, UpdateChannel::StableOnly);
+    let latest_url = format!("{}/releases/latest", release_source::github_api_url());
+    let releases_url = format!("{}/releases?per_page=30", release_source::github_api_url());
     let latest_future = if matches!(channel, UpdateChannel::PrereleaseOnly) {
         None
     } else {
-        Some(fetch_github_json::<GithubRelease>(GITHUB_LATEST_URL))
+        Some(fetch_github_json::<GithubRelease>(&latest_url))
     };
     let list_future = if need_list {
-        Some(fetch_github_json::<Vec<GithubRelease>>(GITHUB_RELEASES_URL))
+        Some(fetch_github_json::<Vec<GithubRelease>>(&releases_url))
     } else {
         None
     };
@@ -1017,7 +1026,7 @@ async fn ensure_channel_candidates(
 }
 
 pub(crate) async fn resolve_catalog(channel: UpdateChannel) -> Result<ReleaseCatalog, String> {
-    if current_locale_is_chinese().await {
+    if release_source::official_mirrors_enabled() && current_locale_is_chinese().await {
         let overall_deadline = Instant::now() + METADATA_OVERALL_TIMEOUT;
         let com = fetch_metadata_endpoint(METADATA_COM_URL, false, overall_deadline);
         let cn = fetch_metadata_endpoint(METADATA_CN_URL, true, overall_deadline);
@@ -1068,7 +1077,7 @@ pub(crate) async fn resolve_component_download_candidates(
         candidates.push(DownloadCandidate { name, url });
     };
 
-    if current_locale_is_chinese().await {
+    if release_source::official_mirrors_enabled() && current_locale_is_chinese().await {
         // The normal metadata path already implements .com/.cn priority and
         // CNB/GitHub fallback. Do not accept a newer or different component:
         // Sidecar must match the installed Sunshine manifest exactly.
@@ -1109,24 +1118,34 @@ mod tests {
     use super::*;
 
     fn metadata_json() -> Vec<u8> {
+        let tag = "v2026.925.152547.杂鱼";
+        let name = "Sunshine.v2026.0925.WindowsInstaller.exe";
+        let github = encoded_download_url(tag, name);
+        // Official metadata points at CNB with a GitHub fallback; fork builds
+        // trust only their own GitHub Releases.
+        let (url, fallback) = if release_source::official_mirrors_enabled() {
+            (encoded_cnb_download_url(tag, name), Some(github))
+        } else {
+            (github, None)
+        };
         serde_json::to_vec(&serde_json::json!({
             "schema": 1,
             "kind": "release-metadata",
             "product": "foundation-sunshine",
             "channels": {
                 "latest": {
-                    "version": "v2026.925.152547.杂鱼",
+                    "version": tag,
                     "prerelease": false,
                     "githubReleaseId": 10,
                     "publishedAt": "2026-09-25T15:45:20Z",
                     "releaseNotes": "# stable",
                     "assets": [{
                         "type": "windows-x64-installer",
-                        "name": "Sunshine.v2026.0925.WindowsInstaller.exe",
+                        "name": name,
                         "size": 10,
                         "sha256": "a".repeat(64),
-                        "url": "https://cnb.cool/AlkaidLab/foundation-sunshine-release/-/releases/download/v2026.925.152547.%E6%9D%82%E9%B1%BC/Sunshine.v2026.0925.WindowsInstaller.exe",
-                        "fallbackUrl": "https://github.com/AlkaidLab/foundation-sunshine/releases/download/v2026.925.152547.%E6%9D%82%E9%B1%BC/Sunshine.v2026.0925.WindowsInstaller.exe"
+                        "url": url,
+                        "fallbackUrl": fallback
                     }, {
                         "type": "future-asset",
                         "name": "ignored.bin",

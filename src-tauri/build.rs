@@ -159,7 +159,29 @@ fn write_capability(commands: &[String]) {
 }
 
 /// Generates Tauri permissions and resources with constants from the shared compatibility contract.
+fn validate_release_repository() {
+    println!("cargo:rerun-if-env-changed=FOUNDATION_RELEASE_REPOSITORY");
+    let Ok(value) = std::env::var("FOUNDATION_RELEASE_REPOSITORY") else {
+        return;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    match value.split_once('/') {
+        Some((owner, repository)) if valid_part(owner) && valid_part(repository) => {}
+        _ => panic!("FOUNDATION_RELEASE_REPOSITORY must be `owner/repo`, got `{value}`"),
+    }
+}
+
 fn main() {
+    validate_release_repository();
     println!("cargo:rerun-if-changed=component-compatibility.json");
     let compatibility: serde_json::Value = serde_json::from_str(
         &fs::read_to_string("component-compatibility.json")
