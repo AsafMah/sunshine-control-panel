@@ -50,7 +50,7 @@ pub(crate) fn sidecar_source_dir() -> Result<PathBuf, String> {
         }
     }
 
-    let sunshine_root = PathBuf::from(crate::sunshine::get_sunshine_install_path());
+    let sunshine_root = crate::sunshine::install_dir();
     let candidates = [
         sunshine_root.join("tools").join("sunshine-ds5-sidecar"),
         sunshine_root
@@ -293,6 +293,52 @@ pub(crate) async fn acquire_sidecar_package(
     .await
 }
 
+/// Auto-discovered archives are an optional download shortcut, never a sticky source choice.
+/// Explicitly selected archives must still fail if they do not match the pinned release.
+/// Returns whether the auto-discovered archive was used, for the installed source metadata.
+pub(crate) async fn acquire_sidecar_package_from_sources(
+    manifest: &SidecarPackageManifest,
+    selected_package: Option<&Path>,
+    discovered_package: Option<&Path>,
+    destination: &Path,
+    progress: &ProgressReporter<'_>,
+) -> Result<bool, String> {
+    acquire_sidecar_package_with_fallback(
+        manifest,
+        selected_package,
+        discovered_package,
+        destination,
+        progress,
+        acquire_sidecar_package(manifest, selected_package, destination, progress),
+    )
+    .await
+}
+
+// Keep final acquisition lazy so tests can supply a local download fixture.
+pub(super) async fn acquire_sidecar_package_with_fallback(
+    manifest: &SidecarPackageManifest,
+    selected_package: Option<&Path>,
+    discovered_package: Option<&Path>,
+    destination: &Path,
+    progress: &ProgressReporter<'_>,
+    fallback: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<bool, String> {
+    if selected_package.is_none()
+        && let Some(source) = discovered_package
+    {
+        report_progress(progress, "sidecar_local", 12);
+        match acquire_sidecar_package(manifest, Some(source), destination, progress).await {
+            Ok(()) => return Ok(true),
+            Err(error) => warn!(
+                "Ignoring auto-discovered DualSense package {}: {error}; falling back to download",
+                source.display()
+            ),
+        }
+    }
+    fallback.await?;
+    Ok(false)
+}
+
 /// Reuses a healthy pinned transport or stages a verified installer during explicit maintenance.
 /// Existing incompatible installations require shared cleanup before replacement.
 #[cfg(target_os = "windows")]
@@ -315,7 +361,13 @@ pub(crate) async fn ensure_pinned_usbip(
         InstallDisposition::Install => {}
     }
 
-    let installer_path = component_root.join(format!("USBip-{USBIP_VERSION}-x64.partial.exe"));
+    let installer_file = tempfile::Builder::new()
+        .prefix("usbip-installer-")
+        .suffix(".exe")
+        .tempfile_in(component_root)
+        .map_err(|error| format!("DS5-DRV-001: unable to stage the USB/IP installer: {error}"))?
+        .into_temp_path();
+    let installer_path = installer_file.to_path_buf();
     let download_result: Result<UsbipInstallResult, String> = async {
         if let Some(source) = local_installer {
             report_progress(progress, "transport_local", 3);
@@ -383,7 +435,6 @@ pub(crate) async fn ensure_pinned_usbip(
         Ok(install_result)
     }
     .await;
-    let _ = fs::remove_file(&installer_path);
     download_result
 }
 
@@ -553,10 +604,15 @@ pub(crate) async fn verify_staged_transport(executable: &Path) -> Result<(), Str
         return Err("DS5-PKG-003: shared USB/IP must be ready and all imports released before component acceptance; reboot or repair the transport if required".to_string());
     }
     let executable = executable.to_path_buf();
-    let result_path = executable.with_file_name("transport-acceptance.json");
-    let result = result_path.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        let _ = fs::remove_file(&result);
+        let result = tempfile::Builder::new()
+            .prefix("transport-acceptance-")
+            .suffix(".json")
+            .tempfile_in(executable.parent().unwrap())
+            .map_err(|error| {
+                format!("DS5-PKG-003: unable to prepare the acceptance result: {error}")
+            })?
+            .into_temp_path();
         let mut command = Command::new(&executable);
         command
             .args(["--self-test", "transport", "--result"])
@@ -582,7 +638,6 @@ pub(crate) async fn verify_staged_transport(executable: &Path) -> Result<(), Str
     })
     .await
     .map_err(|error| format!("DS5-PKG-003: transport acceptance task failed: {error}"))?;
-    let _ = fs::remove_file(&result_path);
     // Check release even on failure; never sweep another application's imports.
     let after = crate::usbip::usbip_get_status().await?;
     if !after.ready || !after.attached_devices.is_empty() {
@@ -604,7 +659,7 @@ pub(crate) async fn dualsense_install_impl(
         .is_none()
         .then(manually_placed_sidecar_package)
         .flatten();
-    let using_discovered_package = discovered_package.is_some();
+    let mut using_discovered_package = false;
     let using_selected_package = selected_sidecar_package.is_some();
     let local_sidecar_package = selected_sidecar_package.or(discovered_package.as_deref());
     let manifest_available = sidecar_package_manifest_path()
@@ -636,28 +691,24 @@ pub(crate) async fn dualsense_install_impl(
     {
         info!("Recovered the previous DualSense component after an interrupted activation");
     }
-    let operation = format!("staging-{}", std::process::id());
-    let staging = root.join(&operation);
-    if staging.exists() {
-        let stale_staging = staging.clone();
-        tokio::task::spawn_blocking(move || {
-            retry_component_fs_operation(|| fs::remove_dir_all(&stale_staging)).map_err(|error| {
-                format!(
-                    "DS5-PKG-002: {}",
-                    component_fs_error("unable to remove stale staging component", &error)
-                )
-            })
-        })
-        .await
-        .map_err(|error| format!("DS5-PKG-002: staging cleanup task failed: {error}"))??;
-    }
-    fs::create_dir(&staging).map_err(|error| error.to_string())?;
+    // Stay on the installation volume so activation can keep using atomic renames.
+    let staging_directory = tempfile::Builder::new()
+        .prefix("staging-")
+        .tempdir_in(&root)
+        .map_err(|error| format!("DS5-PKG-002: unable to prepare component staging: {error}"))?;
+    let staging = staging_directory.path().to_path_buf();
     let current_handoff_packages = [local_sidecar_package, local_packages.usbip.as_deref()]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
     purge_stale_handoff_packages(&root, &current_handoff_packages);
-    let sidecar_archive_path = root.join(format!("{operation}-sidecar.partial.zip"));
+    let sidecar_archive = tempfile::Builder::new()
+        .prefix("sidecar-")
+        .suffix(".partial.zip")
+        .tempfile_in(&root)
+        .map_err(|error| format!("DS5-PKG-002: unable to stage the sidecar archive: {error}"))?
+        .into_temp_path();
+    let sidecar_archive_path = sidecar_archive.to_path_buf();
     let had_previous = active.exists();
     let install_result: Result<UsbipInstallResult, String> = async {
         let usbip_install_result = if install_transport {
@@ -666,12 +717,10 @@ pub(crate) async fn dualsense_install_impl(
             UsbipInstallResult::Ready
         };
         if let Some(manifest) = package_manifest.as_ref() {
-            if using_discovered_package {
-                report_progress(progress, "sidecar_local", 12);
-            }
-            acquire_sidecar_package(
+            using_discovered_package = acquire_sidecar_package_from_sources(
                 manifest,
-                local_sidecar_package,
+                selected_sidecar_package,
+                discovered_package.as_deref(),
                 &sidecar_archive_path,
                 progress,
             )
@@ -745,7 +794,6 @@ pub(crate) async fn dualsense_install_impl(
         Ok(usbip_install_result)
     }
     .await;
-    let _ = fs::remove_file(&sidecar_archive_path);
     if install_result.is_err() {
         let failed_staging = staging.clone();
         match tokio::task::spawn_blocking(move || {
@@ -794,49 +842,43 @@ pub(crate) async fn dualsense_self_test_impl(profile: String) -> Result<serde_js
     if profile != "standard" && profile != "composite" {
         return Err("DS5-PKG-003: invalid self-test profile".to_string());
     }
-    let result_path = component_root().join(format!("self-test-{}.json", std::process::id()));
     #[cfg(target_os = "windows")]
     {
-        let test_profile = profile.clone();
-        let test_result = result_path.clone();
         tokio::task::spawn_blocking(move || {
             let executable = super::packages::verified_sidecar_path()?;
-            let _ = fs::remove_file(&test_result);
+            let result = tempfile::Builder::new()
+                .prefix("self-test-")
+                .suffix(".json")
+                .tempfile_in(component_root())
+                .map_err(|error| {
+                    format!("DS5-PKG-003: unable to prepare the self-test result: {error}")
+                })?
+                .into_temp_path();
             let mut command = Command::new(&executable);
             command
-                .args(["--self-test", &test_profile, "--result"])
-                .arg(&test_result)
+                .args(["--self-test", &profile, "--result"])
+                .arg(&result)
                 .current_dir(executable.parent().unwrap_or_else(|| Path::new(".")));
-            let outcome = run_with_timeout(
+            let output = run_with_timeout(
                 &mut command,
                 std::time::Duration::from_secs(60),
                 "DS5-PKG-003: component self-test timed out",
                 true,
-            )
-            .and_then(|output| {
-                output
-                    .status
-                    .success()
-                    .then_some(())
-                    .ok_or_else(|| component_test_failure(&output, &test_result))
-            });
-            if outcome.is_err() {
-                let _ = fs::remove_file(&test_result);
+            )?;
+            if !output.status.success() {
+                return Err(component_test_failure(&output, &result));
             }
-            outcome
+            let contents = fs::read_to_string(&result).map_err(|error| {
+                format!("DS5-PKG-003: component test produced no result: {error}")
+            })?;
+            serde_json::from_str(&contents)
+                .map_err(|error| format!("DS5-PKG-003: invalid component test result: {error}"))
         })
         .await
-        .map_err(|error| format!("DS5-PKG-003: component test task failed: {error}"))??;
-    };
+        .map_err(|error| format!("DS5-PKG-003: component test task failed: {error}"))?
+    }
     #[cfg(not(target_os = "windows"))]
-    return Err("DS5-PKG-003: component tests are only supported on Windows".to_string());
-    let result = fs::read_to_string(&result_path);
-    let _ = fs::remove_file(&result_path);
-    let result = result
-        .map_err(|error| format!("DS5-PKG-003: component test produced no result: {error}"))?;
-    let json: serde_json::Value = serde_json::from_str(&result)
-        .map_err(|error| format!("DS5-PKG-003: invalid component test result: {error}"))?;
-    Ok(json)
+    Err("DS5-PKG-003: component tests are only supported on Windows".to_string())
 }
 
 pub(crate) async fn dualsense_uninstall_impl() -> Result<DualSenseStatus, String> {

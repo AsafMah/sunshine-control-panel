@@ -9,20 +9,21 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 /// 全局 Sunshine 目标 URL（动态配置）
-static SUNSHINE_TARGET: Lazy<Arc<RwLock<String>>> =
-    Lazy::new(|| Arc::new(RwLock::new(String::from("https://localhost:47990"))));
+static SUNSHINE_TARGET: LazyLock<Arc<RwLock<String>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(String::from("https://localhost:47990"))));
 
 #[cfg(test)]
-static TEST_REFRESH_TARGET: Lazy<std::sync::Mutex<Option<String>>> =
-    Lazy::new(|| std::sync::Mutex::new(None));
+static TEST_REFRESH_TARGET: LazyLock<std::sync::Mutex<Option<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
 
 /// 快速失败机制：记录 Sunshine 是否可用
 static SUNSHINE_AVAILABLE: AtomicBool = AtomicBool::new(true);
@@ -35,12 +36,12 @@ static PROXY_PORT: AtomicU16 = AtomicU16::new(48081);
 /// On a cold GUI start the main window and the async proxy task otherwise race.
 static PROXY_READY: AtomicBool = AtomicBool::new(false);
 static PROXY_START_REQUESTED: AtomicBool = AtomicBool::new(false);
-static PROXY_READY_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
-static PROXY_REQUEST_PERMITS: Lazy<Arc<Semaphore>> =
-    Lazy::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PROXY_REQUESTS)));
-static PROXY_PENDING_PERMITS: Lazy<Arc<Semaphore>> =
-    Lazy::new(|| Arc::new(Semaphore::new(MAX_PENDING_PROXY_REQUESTS)));
-static PROXY_HEALTH_TOKEN: Lazy<String> = Lazy::new(|| uuid::Uuid::new_v4().to_string());
+static PROXY_READY_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+static PROXY_REQUEST_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PROXY_REQUESTS)));
+static PROXY_PENDING_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_PENDING_PROXY_REQUESTS)));
+static PROXY_HEALTH_TOKEN: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
 /// 快速失败冷却时间（秒）- 在此时间内不重试，超过后会重新尝试连接
 const FAST_FAIL_COOLDOWN_SECS: u64 = 3;
@@ -148,8 +149,8 @@ async fn proxy_health_handler(request: Request) -> Response {
 
 /// Wait until the local proxy listener is ready before loading the main frame.
 #[tauri::command]
-pub async fn wait_for_proxy_ready() -> Result<String, String> {
-    ensure_started();
+pub async fn wait_for_proxy_ready(app: AppHandle) -> Result<String, String> {
+    ensure_started(&app);
     if PROXY_READY.load(Ordering::Acquire) {
         return Ok(get_proxy_url());
     }
@@ -172,12 +173,13 @@ pub async fn wait_for_proxy_ready() -> Result<String, String> {
 
 /// Start the local Web UI proxy on first use. Hidden tray-only startup does
 /// not need the router, listener, or proxy HTTP clients resident in memory.
-pub fn ensure_started() {
+pub fn ensure_started<R: Runtime>(app: &AppHandle<R>) {
     if PROXY_READY.load(Ordering::Acquire) || PROXY_START_REQUESTED.swap(true, Ordering::AcqRel) {
         return;
     }
 
-    tauri::async_runtime::spawn(async {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
         if let Ok(dev_target) = std::env::var("WEBUI_DEV_TARGET") {
             info!("🛠️ [开发模式] 检测到 WEBUI_DEV_TARGET 环境变量");
             info!("🎯 代理目标: {}", dev_target);
@@ -192,7 +194,7 @@ pub fn ensure_started() {
             }
         }
 
-        if let Err(e) = start_proxy_server().await {
+        if let Err(e) = start_proxy_server(&app).await {
             error!("❌ 代理服务器启动失败: {}", e);
         }
         PROXY_START_REQUESTED.store(false, Ordering::Release);
@@ -208,7 +210,7 @@ pub fn set_sunshine_target(url: String) {
 }
 
 /// Dynamic Sunshine target helpers.
-fn get_sunshine_target() -> String {
+pub(crate) fn get_sunshine_target() -> String {
     SUNSHINE_TARGET
         .read()
         .map(|url| url.clone())
@@ -433,7 +435,9 @@ async fn acquire_proxy_permit_with_wait(
 }
 
 /// 启动本地代理服务器
-pub async fn start_proxy_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start_proxy_server<R: Runtime>(
+    handle: &AppHandle<R>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     PROXY_READY.store(false, Ordering::Release);
 
     let app = Router::new()
@@ -476,6 +480,10 @@ pub async fn start_proxy_server() -> Result<(), Box<dyn std::error::Error + Send
         }
     };
 
+    // Only our bound proxy origin can invoke WebUI commands. Grant before
+    // publishing readiness, including when the default port was occupied.
+    handle.add_capability(webui_capability(bound_port))?;
+
     // 保存实际使用的端口
     PROXY_PORT.store(bound_port, Ordering::Relaxed);
     PROXY_READY.store(true, Ordering::Release);
@@ -492,6 +500,18 @@ pub async fn start_proxy_server() -> Result<(), Box<dyn std::error::Error + Send
     });
     PROXY_READY.store(false, Ordering::Release);
     result
+}
+
+fn webui_capability(port: u16) -> tauri::ipc::CapabilityBuilder {
+    let permissions: Vec<String> = serde_json::from_str(include_str!("../webui-permissions.json"))
+        .expect("build-validated WebUI permissions");
+    permissions.into_iter().fold(
+        tauri::ipc::CapabilityBuilder::new(format!("sunshine-webui-{port}"))
+            .window("main")
+            .local(false)
+            .remote(format!("http://127.0.0.1:{port}/*")),
+        |capability, permission| capability.permission(permission),
+    )
 }
 
 /// 获取当前时间戳（秒）
@@ -1416,11 +1436,63 @@ fn inject_theme_script(html: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn webui_ipc_is_limited_to_the_bound_main_frame_origin_and_explicit_commands() {
+        let app = tauri::test::mock_builder()
+            .invoke_handler(|invoke| {
+                invoke.resolver.resolve("ok");
+                true
+            })
+            .build(tauri::generate_context!())
+            .unwrap();
+        app.add_capability(super::webui_capability(48090)).unwrap();
+        let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let desktop = tauri::WebviewWindowBuilder::new(&app, "desktop", Default::default())
+            .build()
+            .unwrap();
+        let invoke =
+            |window: &tauri::WebviewWindow<tauri::test::MockRuntime>, url: &str, cmd: &str| {
+                tauri::test::get_ipc_response(
+                    window,
+                    tauri::webview::InvokeRequest {
+                        cmd: cmd.into(),
+                        callback: tauri::ipc::CallbackFn(0),
+                        error: tauri::ipc::CallbackFn(1),
+                        url: url.parse().unwrap(),
+                        body: Default::default(),
+                        headers: Default::default(),
+                        invoke_key: tauri::test::INVOKE_KEY.into(),
+                    },
+                )
+            };
+        let origin = "http://127.0.0.1:48090/config";
+        assert!(invoke(&main, origin, "get_vdd_status").is_ok());
+        for wrong in [
+            "http://127.0.0.1:48081/config",
+            "https://github.com/",
+            "http://localhost:48090/config",
+        ] {
+            assert!(invoke(&main, wrong, "get_vdd_status").is_err(), "{wrong}");
+        }
+        for denied in [
+            "launch_game",
+            "install_update",
+            "capture_screenshot",
+            "restart_as_admin",
+        ] {
+            assert!(invoke(&main, origin, denied).is_err(), "{denied}");
+        }
+        assert!(invoke(&desktop, origin, "get_vdd_status").is_err());
+        assert!(invoke(&main, "http://tauri.localhost/", "get_vdd_status").is_ok());
+    }
+
     use super::*;
     use axum::body::Body;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    static TEST_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+    static TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     async fn unused_local_port() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

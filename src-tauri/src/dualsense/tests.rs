@@ -434,6 +434,141 @@ fn sidecar_package_extracts_only_matching_runtime() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn local_package_manifest(path: &std::path::Path, download_url: &str) -> SidecarPackageManifest {
+    SidecarPackageManifest {
+        schema: 1,
+        component_version: super::COMPONENT_VERSION.to_string(),
+        protocol: super::PROTOCOL_VERSION,
+        target: super::SIDECAR_PACKAGE_TARGET.to_string(),
+        license: super::SIDECAR_PACKAGE_LICENSE.to_string(),
+        asset_name: super::SIDECAR_PACKAGE_ASSET.to_string(),
+        download_url: download_url.to_string(),
+        sha256: sha256_file(path).unwrap(),
+        size: std::fs::metadata(path).unwrap().len(),
+    }
+}
+
+#[tokio::test]
+async fn discovered_sidecar_package_failure_falls_back_to_download() {
+    use axum::{Router, routing::get};
+
+    let app = Router::new().route(
+        "/sidecar.zip",
+        get(|| async { ([("content-type", "application/octet-stream")], "trusted") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let download_url = format!("http://{}/sidecar.zip", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let root = std::env::temp_dir().join(format!("sunshine-ds5-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let package = root.join(super::SIDECAR_PACKAGE_ASSET);
+    let destination = root.join("staged.zip");
+    std::fs::write(&package, b"trusted").unwrap();
+    let manifest = local_package_manifest(&package, &download_url);
+    // Cover different size, same-size SHA-256 mismatch, and a disappeared file.
+    for stale_contents in [Some(b"old".as_slice()), Some(b"changed".as_slice()), None] {
+        std::fs::write(&destination, b"incomplete").unwrap();
+        match stale_contents {
+            Some(contents) => std::fs::write(&package, contents).unwrap(),
+            None => std::fs::remove_file(&package).unwrap(),
+        }
+        let discovered = super::install::acquire_sidecar_package_with_fallback(
+            &manifest,
+            None,
+            Some(&package),
+            &destination,
+            &|_, _| {},
+            async {
+                let bytes = client
+                    .get(&manifest.download_url)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .error_for_status()
+                    .map_err(|error| error.to_string())?
+                    .bytes()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tokio::fs::write(&destination, bytes)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!discovered);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"trusted");
+    }
+    server.abort();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn matching_discovered_sidecar_package_is_used_without_download() {
+    let root = std::env::temp_dir().join(format!("sunshine-ds5-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let package = root.join(super::SIDECAR_PACKAGE_ASSET);
+    let destination = root.join("staged.zip");
+    std::fs::write(&package, b"trusted").unwrap();
+    let manifest = local_package_manifest(&package, "");
+    let discovered = super::install::acquire_sidecar_package_from_sources(
+        &manifest,
+        None,
+        Some(&package),
+        &destination,
+        &|_, _| {},
+    )
+    .await
+    .unwrap();
+    assert!(discovered);
+    assert_eq!(std::fs::read(&destination).unwrap(), b"trusted");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn selected_sidecar_package_is_authoritative_and_never_falls_back() {
+    let root = std::env::temp_dir().join(format!("sunshine-ds5-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let selected = root.join("selected.zip");
+    let discovered = root.join(super::SIDECAR_PACKAGE_ASSET);
+    let destination = root.join("staged.zip");
+    std::fs::write(&selected, b"trusted").unwrap();
+    std::fs::write(&discovered, b"ignored").unwrap();
+    let manifest = local_package_manifest(&selected, "");
+    assert!(
+        !super::install::acquire_sidecar_package_from_sources(
+            &manifest,
+            Some(&selected),
+            Some(&discovered),
+            &destination,
+            &|_, _| {},
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), b"trusted");
+    std::fs::write(&discovered, b"trusted").unwrap();
+    for stale_contents in [b"old".as_slice(), b"changed".as_slice()] {
+        std::fs::write(&selected, stale_contents).unwrap();
+        let error = super::install::acquire_sidecar_package_from_sources(
+            &manifest,
+            Some(&selected),
+            Some(&discovered),
+            &destination,
+            &|_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(error.starts_with("DS5-PKG-005:"), "{error}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn bundled_runtime_rejects_stale_component_metadata() {
     let root = std::env::temp_dir().join(format!("sunshine-ds5-test-{}", uuid::Uuid::new_v4()));
@@ -626,6 +761,36 @@ fn stale_handoff_cleanup_preserves_current_and_unrelated_entries() {
     assert!(unrelated.is_file());
     assert!(matching_directory.is_dir());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn temporary_staging_ownership_preserves_activation_and_rollback() {
+    let root = tempfile::tempdir().unwrap();
+    let active = root.path().join("active");
+    let backup = root.path().join("previous");
+    write_valid_component(&active, b"previous");
+    let staging = tempfile::Builder::new()
+        .prefix("staging-")
+        .tempdir_in(root.path())
+        .unwrap();
+    write_valid_component(staging.path(), b"replacement");
+
+    super::install::activate_staged_component(staging.path(), &active, &backup).unwrap();
+    drop(staging);
+
+    assert_eq!(
+        std::fs::read(active.join(super::SIDECAR_EXE)).unwrap(),
+        b"replacement"
+    );
+    assert_eq!(
+        std::fs::read(backup.join(super::SIDECAR_EXE)).unwrap(),
+        b"previous"
+    );
+    rollback_activated_component(&active, &backup, true).unwrap();
+    assert_eq!(
+        std::fs::read(active.join(super::SIDECAR_EXE)).unwrap(),
+        b"previous"
+    );
 }
 
 #[test]
@@ -867,6 +1032,7 @@ fn usbip_transport_probe_rejects_a_broken_driver_with_a_valid_registration() {
         version_valid: true,
         reboot_recommended: false,
         vhci_residual: false,
+        error_code: "USBIP-EXEC-006".to_string(),
         attached_devices: Vec::new(),
         detail: detail.to_string(),
     };
@@ -968,15 +1134,38 @@ async fn elevated_ipc_receives_multiple_local_packages_with_bounded_framing() {
 
     assert_eq!(packages.len(), contents.len());
     for (package, expected) in packages.iter().zip(contents) {
-        assert_eq!(std::fs::read(package.path()).unwrap(), expected);
+        assert_eq!(std::fs::read(package).unwrap(), expected);
+        assert_eq!(package.parent(), Some(root.as_path()));
     }
     let paths = packages
         .iter()
-        .map(|package| package.path().to_path_buf())
+        .map(|package| package.to_path_buf())
         .collect::<Vec<_>>();
     drop(packages);
     assert!(paths.iter().all(|path| !path.exists()));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn elevated_ipc_cleans_completed_and_partial_packages_on_transfer_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let mut encoded = vec![2u8];
+    encoded.extend_from_slice(&3u64.to_le_bytes());
+    encoded.extend_from_slice(b"one");
+    encoded.extend_from_slice(&10u64.to_le_bytes());
+    encoded.extend_from_slice(b"truncated");
+
+    let error = super::receive_local_component_packages_into(
+        &mut encoded.as_slice(),
+        uuid::Uuid::new_v4(),
+        root.path(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.contains("transfer ended early"), "{error}");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
 #[cfg(target_os = "windows")]

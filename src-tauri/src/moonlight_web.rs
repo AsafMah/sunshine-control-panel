@@ -1,5 +1,5 @@
 use log::{debug, info, warn};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -15,10 +15,10 @@ const PROCESS_CHECK_NAME: &str = "web-server.exe";
 // ========== 状态管理 ==========
 
 /// 子进程句柄（由控制面板启动时持有）
-static CHILD_PROCESS: Lazy<Mutex<Option<std::process::Child>>> = Lazy::new(|| Mutex::new(None));
+static CHILD_PROCESS: LazyLock<Mutex<Option<std::process::Child>>> = LazyLock::new(|| Mutex::new(None));
 
 /// 当前配置的绑定端口
-static BIND_PORT: Lazy<Mutex<u16>> = Lazy::new(|| Mutex::new(DEFAULT_BIND_PORT));
+static BIND_PORT: LazyLock<Mutex<u16>> = LazyLock::new(|| Mutex::new(DEFAULT_BIND_PORT));
 
 // ========== 数据结构 ==========
 
@@ -192,38 +192,42 @@ fn get_config_path() -> PathBuf {
 /// 获取 moonlight-web 状态
 #[tauri::command]
 pub async fn moonlight_web_get_status() -> Result<MoonlightWebStatus, String> {
-    let install_dir = get_install_dir();
-    let binary_path = get_server_binary_path();
-    let installed = binary_path.exists();
-    let running = is_process_running();
-    let port = *BIND_PORT.lock().unwrap();
+    tokio::task::spawn_blocking(|| {
+        let install_dir = get_install_dir();
+        let binary_path = get_server_binary_path();
+        let installed = binary_path.exists();
+        let running = is_process_running();
+        let port = *BIND_PORT.lock().unwrap();
 
-    let version = if installed {
-        get_installed_version().unwrap_or_else(|| "unknown".to_string())
-    } else {
-        String::new()
-    };
-
-    // 根据配置判断协议并生成访问 URL
-    let access_url = if running {
-        let scheme = if has_https_certificate() {
-            "https"
+        let version = if installed {
+            get_installed_version().unwrap_or_else(|| "unknown".to_string())
         } else {
-            "http"
+            String::new()
         };
-        format!("{}://localhost:{}", scheme, port)
-    } else {
-        String::new()
-    };
 
-    Ok(MoonlightWebStatus {
-        installed,
-        running,
-        install_path: install_dir.to_string_lossy().to_string(),
-        version,
-        access_url,
-        port,
+        // 根据配置判断协议并生成访问 URL
+        let access_url = if running {
+            let scheme = if has_https_certificate() {
+                "https"
+            } else {
+                "http"
+            };
+            format!("{}://localhost:{}", scheme, port)
+        } else {
+            String::new()
+        };
+
+        Ok(MoonlightWebStatus {
+            installed,
+            running,
+            install_path: install_dir.to_string_lossy().to_string(),
+            version,
+            access_url,
+            port,
+        })
     })
+    .await
+    .map_err(|error| format!("moonlight-web status query failed: {error}"))?
 }
 
 /// 启动 moonlight-web 服务

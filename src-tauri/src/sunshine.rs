@@ -1,9 +1,9 @@
 use log::{debug, error, info, warn};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::sync::{Mutex, RwLock};
 use url::Url;
 
@@ -20,10 +20,9 @@ pub struct SunshineConfig {
 }
 
 // 缓存 Sunshine 路径，避免重复查找和记录日志
-static SUNSHINE_PATH_CACHE: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
-static RUNTIME_SUNSHINE_URL: Lazy<RwLock<Option<String>>> = Lazy::new(|| RwLock::new(None));
-static LOCALE_WRITE_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
-static HTTPS_CLIENT: Lazy<Result<reqwest::Client, String>> = Lazy::new(|| {
+static SUNSHINE_PATH_CACHE: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+static RUNTIME_SUNSHINE_URL: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
+static HTTPS_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -31,8 +30,19 @@ static HTTPS_CLIENT: Lazy<Result<reqwest::Client, String>> = Lazy::new(|| {
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))
 });
+// Local tray reads bypass environment proxies and have a shorter deadline.
+pub(crate) const TRAY_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+static TRAY_HTTPS_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(TRAY_STATE_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Create tray status HTTP client failed: {error}"))
+});
 const MAX_CONFIG_SAVE_RESPONSE_BYTES: usize = 64 * 1024;
-static SSE_HTTPS_CLIENT: Lazy<Result<reqwest::Client, String>> = Lazy::new(|| {
+static SSE_HTTPS_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -571,6 +581,52 @@ mod tray_protocol_tests {
         assert!(validate_tray_state(&valid_state()).is_ok());
     }
 
+    async fn stalled_tray_request(send_headers: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/state", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            if send_headers {
+                // Successful headers must not exempt a stalled response body
+                // from the same three-second request deadline.
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                    .await
+                    .unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            TRAY_STATE_TIMEOUT + std::time::Duration::from_secs(2),
+            request_tray_state(&endpoint),
+        )
+        .await;
+        server.abort();
+        result
+            .expect("tray request exceeded its deadline")
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn tray_status_times_out_when_core_never_sends_headers() {
+        let error = stalled_tray_request(false).await;
+        assert!(error.starts_with("Request tray state failed:"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn tray_status_times_out_when_core_stalls_the_body() {
+        let error = stalled_tray_request(true).await;
+        assert!(
+            error.starts_with("Read tray state response failed:"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn rejects_incomplete_tray_protocol() {
         let mut state = valid_state();
@@ -856,10 +912,13 @@ impl SessionInfo {
 
 pub async fn get_tray_state() -> Result<TrayState, String> {
     let tray_state_url = local_tray_endpoint("state").await?;
+    request_tray_state(&tray_state_url).await
+}
 
-    let client = create_https_client()?;
+async fn request_tray_state(tray_state_url: &str) -> Result<TrayState, String> {
+    let client = TRAY_HTTPS_CLIENT.as_ref().map_err(Clone::clone)?;
     let response = client
-        .get(&tray_state_url)
+        .get(tray_state_url)
         .send()
         .await
         .map_err(|e| format!("Request tray state failed: {}", e))?;
@@ -1015,7 +1074,6 @@ async fn post_sunshine_config_to(
     }
     validate_config_save_response(&response_body)
 }
-
 
 #[tauri::command]
 pub async fn get_active_sessions() -> Result<Vec<SessionInfo>, String> {
@@ -1419,7 +1477,9 @@ pub async fn get_sunshine_locale() -> Result<String, String> {
 /// 设置 Sunshine 配置中的 locale
 /// 先读取完整配置，合并 locale 字段后再写回，避免覆盖其他配置项
 async fn serialize_locale_write<T>(operation: impl Future<Output = T>) -> T {
-    let _guard = LOCALE_WRITE_LOCK.lock().await;
+    // /api/config 是整表替换语义：读文件与 POST 之间必须与其他全表写者互斥，
+    // 否则并发写者的字段会被旧快照覆盖丢失（见 controller_hub.rs 的锁约定）。
+    let _guard = crate::device_config::DEVICE_CONFIG_LOCK.lock().await;
     operation.await
 }
 
