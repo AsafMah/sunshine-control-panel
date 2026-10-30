@@ -413,9 +413,12 @@ pub fn get_command_line_url() -> Option<String> {
     std::env::args().find_map(|arg| arg.strip_prefix("--url=").map(String::from))
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SessionInfo {
     pub client_name: String,
+    /// Certificate UUID of the paired client (binds file offers to it).
+    #[serde(default)]
+    pub client_uuid: String,
     pub client_address: String,
     pub state: String,
     pub session_id: i32,
@@ -853,6 +856,11 @@ pub async fn confirm_vdd_keep(operation_id: u64, keep: bool) -> Result<TrayActio
 impl SessionInfo {
     fn from_json(session_obj: &serde_json::Value) -> Self {
         Self {
+            client_uuid: session_obj
+                .get("client_uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
             client_name: session_obj
                 .get("client_name")
                 .and_then(|v| v.as_str())

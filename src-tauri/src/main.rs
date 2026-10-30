@@ -5,6 +5,7 @@ mod app;
 mod bat_runner;
 mod client_fingerprint_rules;
 mod clipboard;
+mod clipboard_files;
 mod commands;
 mod controller_hub;
 mod controller_input;

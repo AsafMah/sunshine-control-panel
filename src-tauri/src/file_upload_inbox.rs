@@ -482,6 +482,7 @@ pub fn handle_file_list(payload: Vec<u8>, sid: Option<u32>) {
         let count = frame.count;
         match receive(frame, sid).await {
             Ok(entries) => {
+                crate::clipboard_files::remember_written(&entries);
                 let placed =
                     tauri::async_runtime::spawn_blocking(move || set_clipboard_files(&entries))
                         .await

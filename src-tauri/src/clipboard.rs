@@ -454,7 +454,8 @@ fn snapshot_and_post(echo: &Arc<Mutex<EchoState>>) {
     if let Ok(files) = ctx.get_files() {
         if !files.is_empty() && text_bytes.is_none() && png_bytes.is_none() {
             st.current = None;
-            debug!("local file clipboard without transferable payload; sync skipped");
+            debug!("local file clipboard without transferable payload; offering files");
+            crate::clipboard_files::handle_local_files(files);
             return;
         }
     }
@@ -599,6 +600,29 @@ async fn post_item(body: Vec<u8>) -> Result<(), String> {
             url.trim_end_matches('/')
         ))
         .header("Content-Type", "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("status {}", resp.status()));
+    }
+    Ok(())
+}
+
+/// Sends a FILE_LIST (kind 5) frame to one stream session only.
+pub async fn post_file_list_payload(payload: Vec<u8>, sid: u32) -> Result<(), String> {
+    let body = encode_frame(&Frame {
+        kind: Kind::FileList,
+        token: 0,
+        payload,
+    });
+    let url = get_sunshine_url().await?;
+    let client = create_https_client()?;
+    let resp = client
+        .post(format!("{}/api/v1/clipboard/item", url.trim_end_matches('/')))
+        .header("Content-Type", "application/octet-stream")
+        .header("X-Clipboard-Target-Sid", sid.to_string())
         .body(body)
         .send()
         .await
