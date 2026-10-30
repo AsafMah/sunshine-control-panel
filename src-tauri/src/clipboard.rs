@@ -65,6 +65,8 @@ const KIND_TEXT: u8 = 1;
 const KIND_PNG: u8 = 2;
 const KIND_REF: u8 = 3;
 const KIND_FILE_OFFER: u8 = 4;
+/// Client -> host: committed upload manifest (see file_upload_inbox).
+const KIND_FILE_LIST: u8 = 5;
 
 const MAX_TEXT_BYTES: usize = 1 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024; // matches service blob cap
@@ -130,6 +132,7 @@ enum Kind {
     Png,
     Ref,
     FileOffer,
+    FileList,
 }
 
 impl Kind {
@@ -139,6 +142,7 @@ impl Kind {
             KIND_PNG => Some(Kind::Png),
             KIND_REF => Some(Kind::Ref),
             KIND_FILE_OFFER => Some(Kind::FileOffer),
+            KIND_FILE_LIST => Some(Kind::FileList),
             _ => None,
         }
     }
@@ -148,6 +152,7 @@ impl Kind {
             Kind::Png => KIND_PNG,
             Kind::Ref => KIND_REF,
             Kind::FileOffer => KIND_FILE_OFFER,
+            Kind::FileList => KIND_FILE_LIST,
         }
     }
 }
@@ -735,6 +740,9 @@ fn handle_inbound_frame(frame: Frame, echo: &Arc<Mutex<EchoState>>) {
             let token = frame.token;
             deliver_burst_png(token, &frame.payload, echo);
         }
+        Kind::FileList => {
+            warn!("unexpected FILE_LIST on the frame path; dropped");
+        }
         Kind::FileOffer => {
             // Keep the legacy warn-and-drop path (apply_inbound_inline
             // rejects file offers on the host agent).
@@ -1006,6 +1014,10 @@ fn apply_inbound_inline(frame: Frame, echo: &Arc<Mutex<EchoState>>) {
             // to the host clipboard.
             warn!("inbound file offer on host GUI agent; dropped");
         }
+        Kind::FileList => {
+            // Routed to file_upload_inbox by the SSE pump before this point.
+            warn!("unexpected FILE_LIST on the inline path; dropped");
+        }
     }
 }
 
@@ -1086,8 +1098,12 @@ async fn sse_pump(stop: Arc<Notify>, echo: Arc<Mutex<EchoState>>) {
                         // Parse \n\n-separated SSE events.
                         while let Some(end) = find_event_end(&buf) {
                             let raw = buf.drain(..end + 2).collect::<Vec<u8>>();
-                            if let Some(frame) = parse_sse_event(&raw) {
-                                handle_inbound_frame(frame, &echo);
+                            if let Some((frame, sid)) = parse_sse_event(&raw) {
+                                if frame.kind == Kind::FileList {
+                                    crate::file_upload_inbox::handle_file_list(frame.payload, sid);
+                                } else {
+                                    handle_inbound_frame(frame, &echo);
+                                }
                             }
                         }
                     }
@@ -1127,11 +1143,17 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
 }
 
-fn parse_sse_event(raw: &[u8]) -> Option<Frame> {
+/// Returns the frame and the stream session id Sunshine put in the SSE id:.
+fn parse_sse_event(raw: &[u8]) -> Option<(Frame, Option<u32>)> {
     let s = std::str::from_utf8(raw).ok()?;
     let mut data_b64: Option<String> = None;
+    let mut sid: Option<u32> = None;
     for line in s.split('\n') {
         let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("id:") {
+            sid = rest.trim().parse::<u32>().ok();
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("data: ") {
             data_b64 = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("data:") {
@@ -1140,7 +1162,7 @@ fn parse_sse_event(raw: &[u8]) -> Option<Frame> {
     }
     let b64 = data_b64?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    decode_frame(&bytes)
+    decode_frame(&bytes).map(|frame| (frame, sid))
 }
 
 // ---------- Heartbeat ----------
@@ -1634,5 +1656,27 @@ mod echo_tests {
         let encoded = ClipboardIdentity::new(None, Some(b"png"), None);
         assert!(!state.observe(encoded));
         assert!(state.observe(encoded));
+    }
+}
+
+#[cfg(test)]
+mod file_list_sse_tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn sse_event_carries_session_id_and_file_list_kind() {
+        let frame = encode_frame(&Frame {
+            kind: Kind::FileList,
+            token: 0,
+            payload: b"{}".to_vec(),
+        });
+        let b64 = base64::engine::general_purpose::STANDARD.encode(frame);
+        let raw = format!("id: 4242\nevent: clipboard\ndata: {b64}\n\n");
+        let (parsed, sid) = parse_sse_event(raw.as_bytes()).unwrap();
+        assert_eq!(parsed.kind, Kind::FileList);
+        assert_eq!(sid, Some(4242));
+        let no_id = format!("event: clipboard\ndata: {b64}\n\n");
+        assert_eq!(parse_sse_event(no_id.as_bytes()).unwrap().1, None);
     }
 }

@@ -16,6 +16,7 @@ mod dualsense;
 mod elevation;
 mod file_mapping;
 mod file_transfer;
+mod file_upload_inbox;
 mod fs_utils;
 mod game_session;
 mod github_download;
