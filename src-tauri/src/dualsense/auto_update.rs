@@ -3,6 +3,48 @@
 use super::COMPONENT_VERSION;
 use super::packages::InstalledComponentManifest;
 
+/// Last automatic-update outcome that needs the user's attention; empty when
+/// the update succeeded or was not needed. Surfaced in `DualSenseStatus`.
+static LAST_AUTO_UPDATE_ISSUE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub(crate) fn last_auto_update_issue() -> String {
+    LAST_AUTO_UPDATE_ISSUE
+        .lock()
+        .map(|issue| issue.clone())
+        .unwrap_or_default()
+}
+
+pub(crate) fn record_auto_update_issue(issue: Option<String>) {
+    if let Some(issue) = issue.as_deref() {
+        log::warn!("{issue}");
+    }
+    if let Ok(mut current) = LAST_AUTO_UPDATE_ISSUE.lock() {
+        *current = issue.unwrap_or_default();
+    }
+}
+
+/// Explains why the idle-time update did not run, or how it failed.
+pub(crate) fn auto_update_issue(installed: &str, blocker: AutoUpdateBlocker<'_>) -> String {
+    let target = COMPONENT_VERSION;
+    match blocker {
+        AutoUpdateBlocker::NoPackage => format!(
+            "DS5-UPD-001: the DualSense component {installed} was not updated to {target} automatically: this Sunshine build has no {target} package source; update manually from a local package"
+        ),
+        AutoUpdateBlocker::Transport(detail) => format!(
+            "DS5-UPD-002: the DualSense component {installed} was not updated to {target} automatically because shared USB/IP is not ready: {detail}"
+        ),
+        AutoUpdateBlocker::Failed(error) => format!(
+            "DS5-UPD-003: the automatic DualSense component update {installed} -> {target} failed and was rolled back: {error}"
+        ),
+    }
+}
+
+pub(crate) enum AutoUpdateBlocker<'a> {
+    NoPackage,
+    Transport(&'a str),
+    Failed(&'a str),
+}
+
 /// Parses the three numeric release components used for component upgrade ordering.
 fn version(value: &str) -> Option<(u32, u32, u32)> {
     let mut parts = value.split('.');
@@ -45,6 +87,14 @@ pub(crate) fn installed_update_needed() -> bool {
     needs_update(manifest.as_ref())
 }
 
+#[cfg(target_os = "windows")]
+fn installed_component_version() -> String {
+    super::packages::installed_component_manifest()
+        .map(|manifest| manifest.component_version)
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| "(unknown)".to_string())
+}
+
 /// Updates an existing component only while idle and the shared transport is ready.
 /// Automatic updates never deploy or repair the shared driver.
 #[cfg(target_os = "windows")]
@@ -53,7 +103,7 @@ pub(crate) fn start_installed_component_update(app: tauri::AppHandle) {
     use super::elevated::{ElevatedOperation, run_elevated_operation};
     use super::packages::{manually_placed_sidecar_package, sidecar_package_manifest};
     use super::probe::ensure_no_active_session;
-    use log::{info, warn};
+    use log::info;
 
     tauri::async_runtime::spawn(async move {
         loop {
@@ -62,15 +112,25 @@ pub(crate) fn start_installed_component_update(app: tauri::AppHandle) {
                 continue;
             };
             if !installed_update_needed() {
+                record_auto_update_issue(None);
                 return;
             }
+            let installed = installed_component_version();
             let Ok(package) = sidecar_package_manifest() else {
                 // The host package, not the optional component installer,
                 // supplies this pin. A newer standalone GUI must wait for a
                 // matching Sunshine update; never reuse an older URL/digest.
+                record_auto_update_issue(Some(auto_update_issue(
+                    &installed,
+                    AutoUpdateBlocker::NoPackage,
+                )));
                 return;
             };
             if package.download_url.is_empty() && manually_placed_sidecar_package().is_none() {
+                record_auto_update_issue(Some(auto_update_issue(
+                    &installed,
+                    AutoUpdateBlocker::NoPackage,
+                )));
                 return;
             }
             if ensure_no_active_session().await.is_err() {
@@ -81,20 +141,36 @@ pub(crate) fn start_installed_component_update(app: tauri::AppHandle) {
             // Updates never repair shared drivers. Check before elevation and
             // download so an incompatible/busy transport cannot cause a dead end.
             let transport = crate::usbip::usbip_get_status().await;
-            if !transport.is_ok_and(|status| status.ready && status.attached_devices.is_empty()) {
-                warn!(
-                    "DualSense update requires shared transport maintenance or release of imported devices"
-                );
+            let transport_blocker = match &transport {
+                Ok(status) if status.ready && status.attached_devices.is_empty() => None,
+                Ok(status) if status.ready => {
+                    Some("imported USB/IP devices must be released first".to_string())
+                }
+                Ok(status) if status.detail.is_empty() => {
+                    Some("the transport check did not pass".to_string())
+                }
+                Ok(status) => Some(status.detail.clone()),
+                Err(error) => Some(error.clone()),
+            };
+            if let Some(detail) = transport_blocker {
+                record_auto_update_issue(Some(auto_update_issue(
+                    &installed,
+                    AutoUpdateBlocker::Transport(&detail),
+                )));
                 return;
             }
             info!("Updating the installed DualSense component to {COMPONENT_VERSION}");
             // Reuse the same authorization, verified download, staging and
             // rollback as manual updates. This mode never installs USB/IP.
             match run_elevated_operation(Some(&app), ElevatedOperation::Update, &[]).await {
-                Ok(_) => info!("DualSense component update completed"),
-                Err(error) => warn!(
-                    "DualSense automatic update failed; manual update remains available: {error}"
-                ),
+                Ok(_) => {
+                    info!("DualSense component update completed");
+                    record_auto_update_issue(None);
+                }
+                Err(error) => record_auto_update_issue(Some(auto_update_issue(
+                    &installed,
+                    AutoUpdateBlocker::Failed(&error),
+                ))),
             }
             // Never repeatedly prompt for elevation or retry a failed download
             // in the background. A later launch or manual update can retry.

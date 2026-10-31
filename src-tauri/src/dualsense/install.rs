@@ -350,6 +350,10 @@ pub(crate) async fn ensure_pinned_usbip(
     match install_disposition(installed_usbip_version()?.as_deref())? {
         InstallDisposition::Ready => {
             let status = crate::usbip::usbip_get_status().await?;
+            if status.reboot_recommended {
+                // Repairing cannot help until Windows finishes the pending driver change.
+                return Err(status.detail);
+            }
             if !status.ready {
                 return Err(format!(
                     "USBIP-SETUP-008: existing USB/IP transport needs repair before reuse: {}",
@@ -400,6 +404,9 @@ pub(crate) async fn ensure_pinned_usbip(
         }
 
         report_progress(progress, "transport_installing", 10);
+        // The installer reactivates services pended for deletion, which hides
+        // that the old driver stays loaded until Windows restarts.
+        crate::usbip::record_live_pending_deletion();
         let executable = installer_path.clone();
         let output = tokio::task::spawn_blocking(move || {
             let mut command = Command::new(executable);
@@ -427,6 +434,9 @@ pub(crate) async fn ensure_pinned_usbip(
             }
         })?;
         let install_result = classify_usbip_installer_exit_code(output.status.code())?;
+        if matches!(install_result, UsbipInstallResult::RebootRecommended) {
+            crate::usbip::record_restart_required("the USB/IP installer requested a restart");
+        }
         if installed_usbip_version()?.as_deref() != Some(USBIP_VERSION) {
             return Err(format!(
                 "DS5-DRV-001: USB/IP installer completed but version {USBIP_VERSION} is not registered"
@@ -595,14 +605,40 @@ pub(crate) fn validate_transport_acceptance(value: &serde_json::Value) -> Result
     Ok(())
 }
 
+/// Classifies the shared transport before acceptance so a pending restart or an
+/// unready driver is reported as such instead of as a generic test failure.
+pub(crate) fn transport_precheck(status: &crate::usbip::UsbipStatus) -> Result<(), String> {
+    if status.reboot_recommended || status.error_code == crate::usbip::USBIP_RESTART_CODE {
+        return Err(status.detail.clone());
+    }
+    if !status.ready {
+        let detail = if status.detail.is_empty() {
+            "the transport check did not pass".to_string()
+        } else {
+            status.detail.clone()
+        };
+        return Err(format!(
+            "USBIP-SETUP-008: shared USB/IP is not available, so the component test was not started: {detail}"
+        ));
+    }
+    if !status.attached_devices.is_empty() {
+        return Err(
+            "USBIP-SETUP-009: release imported USB/IP devices before component maintenance"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Exercises the staged runtime before activation with no active stream or imports.
 /// Rechecks release after test failure without detaching another application's devices.
 pub(crate) async fn verify_staged_transport(executable: &Path) -> Result<(), String> {
     super::probe::ensure_no_active_session().await?;
+    // The acceptance creates a composite controller and waits for its speaker
+    // endpoint, which Windows hides from a Remote Desktop session.
+    super::diagnostics::ensure_local_audio_session()?;
     let before = crate::usbip::usbip_get_status().await?;
-    if !before.ready || !before.attached_devices.is_empty() {
-        return Err("DS5-PKG-003: shared USB/IP must be ready and all imports released before component acceptance; reboot or repair the transport if required".to_string());
-    }
+    transport_precheck(&before)?;
     let executable = executable.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
         let result = tempfile::Builder::new()
@@ -844,6 +880,9 @@ pub(crate) async fn dualsense_self_test_impl(profile: String) -> Result<serde_js
     }
     #[cfg(target_os = "windows")]
     {
+        if profile == "composite" {
+            super::diagnostics::ensure_local_audio_session()?;
+        }
         tokio::task::spawn_blocking(move || {
             let executable = super::packages::verified_sidecar_path()?;
             let result = tempfile::Builder::new()

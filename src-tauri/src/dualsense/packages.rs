@@ -316,12 +316,19 @@ pub(crate) fn purge_stale_handoff_packages(root: &Path, current_packages: &[&Pat
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with("handoff-")
-            && (name.ends_with(".partial") || name.ends_with(".partial.zip"))
-        {
+        if is_stale_package_name(name) {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+/// Temporary package files that only a killed elevated helper leaves behind
+/// (normal failures delete their own temp files). Runs under the component
+/// operation lock before the current operation creates its own temp files.
+pub(crate) fn is_stale_package_name(name: &str) -> bool {
+    (name.starts_with("handoff-") && (name.ends_with(".partial") || name.ends_with(".partial.zip")))
+        || (name.starts_with("sidecar-") && name.ends_with(".partial.zip"))
+        || (name.starts_with("usbip-installer-") && name.ends_with(".exe"))
 }
 
 pub(crate) fn installed_component_manifest() -> Option<InstalledComponentManifest> {
@@ -347,8 +354,17 @@ pub(crate) fn validate_sidecar_integrity(
             .sidecar_sha256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit());
-    if manifest.component_version != COMPONENT_VERSION
-        || manifest.sidecar_file != SIDECAR_EXE
+    if manifest.component_version != COMPONENT_VERSION {
+        return Err(format!(
+            "DS5-PKG-005: the installed DualSense component {} is outdated; update it to {COMPONENT_VERSION}",
+            if manifest.component_version.is_empty() {
+                "(unknown version)"
+            } else {
+                manifest.component_version.as_str()
+            }
+        ));
+    }
+    if manifest.sidecar_file != SIDECAR_EXE
         || manifest.usbip_policy != crate::usbip::USBIP_POLICY
         || manifest.usbip_version != crate::usbip::USBIP_VERSION
         || !valid_digest

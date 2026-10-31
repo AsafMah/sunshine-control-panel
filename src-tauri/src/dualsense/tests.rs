@@ -764,6 +764,86 @@ fn stale_handoff_cleanup_preserves_current_and_unrelated_entries() {
 }
 
 #[test]
+fn killed_helper_leftovers_are_swept_before_the_next_attempt() {
+    let root = tempfile::tempdir().unwrap();
+    // The observed leftover: a 0-byte sidecar archive from an interrupted update.
+    let partial = root.path().join("sidecar-AbC123.partial.zip");
+    let installer = root.path().join("usbip-installer-XyZ.exe");
+    let active_like = root.path().join("sidecar-notes.txt");
+    std::fs::write(&partial, b"").unwrap();
+    std::fs::write(&installer, b"mz").unwrap();
+    std::fs::write(&active_like, b"keep").unwrap();
+    super::purge_stale_handoff_packages(root.path(), &[]);
+    assert!(!partial.exists());
+    assert!(!installer.exists());
+    assert!(active_like.is_file());
+}
+
+#[test]
+fn outdated_component_manifest_reports_update_not_corruption() {
+    let manifest = InstalledComponentManifest {
+        component_version: "1.4.1".into(),
+        sidecar_file: super::SIDECAR_EXE.into(),
+        ..Default::default()
+    };
+    let error = super::packages::validate_sidecar_integrity(std::path::Path::new("missing.exe"), &manifest)
+        .unwrap_err();
+    assert!(
+        error.starts_with("DS5-PKG-005: the installed DualSense component 1.4.1 is outdated"),
+        "{error}"
+    );
+    assert!(error.contains(super::COMPONENT_VERSION));
+}
+
+fn transport(ready: bool, reboot: bool, code: &str, detail: &str) -> crate::usbip::UsbipStatus {
+    crate::usbip::UsbipStatus {
+        supported: true,
+        installed: true,
+        ready,
+        version: "0.9.8.1".into(),
+        version_valid: true,
+        reboot_recommended: reboot,
+        vhci_residual: false,
+        error_code: code.into(),
+        attached_devices: Vec::new(),
+        detail: detail.into(),
+    }
+}
+
+#[test]
+fn transport_precheck_names_a_pending_restart_instead_of_a_test_failure() {
+    let restart = "USBIP-SETUP-010: Windows must restart to finish the USB/IP driver change (driver service usbip2_ude is pending deletion).";
+    let error = super::install::transport_precheck(&transport(false, true, "USBIP-SETUP-010", restart))
+        .unwrap_err();
+    assert_eq!(error, restart);
+    let error = super::install::transport_precheck(&transport(
+        false,
+        false,
+        "USBIP-EXEC-007",
+        "USBIP-EXEC-007: listing attached devices failed: error: Multiple instances of VHCI device interface found",
+    ))
+    .unwrap_err();
+    assert!(error.starts_with("USBIP-SETUP-008:"), "{error}");
+    assert!(error.contains("Multiple instances of VHCI device interface found"));
+    assert!(super::install::transport_precheck(&transport(true, false, "", "")).is_ok());
+}
+
+#[test]
+fn automatic_update_issues_say_why_the_component_was_not_replaced() {
+    use super::auto_update::{AutoUpdateBlocker, auto_update_issue};
+    let blocked = auto_update_issue(
+        "1.4.1",
+        AutoUpdateBlocker::Transport("USBIP-EXEC-007: listing attached devices failed"),
+    );
+    assert!(blocked.starts_with("DS5-UPD-002:"), "{blocked}");
+    assert!(blocked.contains("1.4.1") && blocked.contains(super::COMPONENT_VERSION));
+    assert!(blocked.contains("USBIP-EXEC-007"));
+    let failed = auto_update_issue("1.4.1", AutoUpdateBlocker::Failed("DS5-SESSION-001: remote"));
+    assert!(failed.starts_with("DS5-UPD-003:") && failed.contains("rolled back"));
+    assert!(auto_update_issue("1.4.1", AutoUpdateBlocker::NoPackage).starts_with("DS5-UPD-001:"));
+}
+
+#[test]
 fn temporary_staging_ownership_preserves_activation_and_rollback() {
     let root = tempfile::tempdir().unwrap();
     let active = root.path().join("active");
@@ -1263,8 +1343,14 @@ fn component_test_failure_preserves_sidecar_diagnostic() {
     let error = component_test_failure(&output, &result_path);
     let _ = std::fs::remove_file(result_path);
 
+    // The summary stays first; the full sidecar text and exit code follow it.
+    let (headline, details) = error
+        .split_once(super::diagnostics::DIAGNOSTIC_MARKER)
+        .expect("diagnostics block");
     assert_eq!(
-        error,
+        headline,
         "DS5-PKG-003: component test failed: usbip-win2 attach failed"
     );
+    assert!(details.contains("exit code: 1"));
+    assert!(details.contains("--result error:\nusbip-win2 attach failed"));
 }
