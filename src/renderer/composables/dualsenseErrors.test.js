@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  dualSenseDiagnosticDetail,
   dualSenseErrorCode,
   friendlyDualSenseError,
   safeDualSenseTechnicalError,
@@ -104,5 +105,20 @@ describe('DualSense user-facing errors', () => {
     assert.equal(friendlyDualSenseError('DS5-NEW-999: internal detail', messages, 'test'),
       'The device test failed.',
     )
+  })
+
+  it('exposes the full sidecar diagnostics for the RDP render-endpoint failure', () => {
+    const raw = 'DS5-SESSION-001: the DualSense audio test cannot run in a Remote Desktop session (session 2, console session 1).'
+      + '\n\n--- diagnostics ---\nexit code: 1\n\nsession: id 2 (console 1), protocol RDP, remote true'
+      + '\n\n--result error:\nSystem.TimeoutException: The current controller did not create an active render endpoint'
+      + '\n   at Sunshine.Ds5Sidecar.DefaultAudioEndpointGuard.WaitForNewRenderEndpoint(...)'
+      + '\n\nstderr:\nsee https://example.invalid/private'
+    assert.equal(dualSenseErrorCode(raw), 'DS5-SESSION-001')
+    const detail = dualSenseDiagnosticDetail(raw)
+    assert.match(detail, /did not create an active render endpoint/)
+    assert.match(detail, /WaitForNewRenderEndpoint/)
+    assert.match(detail, /protocol RDP, remote true/)
+    assert.doesNotMatch(detail, /example\.invalid/)
+    assert.equal(dualSenseDiagnosticDetail('DS5-PKG-003: component test failed: x'), '')
   })
 })

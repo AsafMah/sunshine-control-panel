@@ -197,24 +197,28 @@ pub(crate) fn run_installed_probe() -> Result<ProbeResult, String> {
     run_probe(&verified_sidecar_path()?)
 }
 
+/// Formats, logs and persists a failed sidecar test with its full diagnostics.
 pub(crate) fn component_test_failure(output: &std::process::Output, result_path: &Path) -> String {
-    if let Ok(contents) = fs::read_to_string(result_path)
-        && let Ok(result) = serde_json::from_str::<serde_json::Value>(&contents)
-        && let Some(error) = result.get("error").and_then(serde_json::Value::as_str)
-        && let Some(summary) = error.lines().find(|line| !line.trim().is_empty())
-    {
-        return format!("DS5-PKG-003: component test failed: {}", summary.trim());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        return format!("DS5-PKG-003: component test failed: {}", stderr.trim());
-    }
-
-    format!(
-        "DS5-PKG-003: component test process failed with exit code {}",
-        output.status.code().unwrap_or(-1)
-    )
+    let result_error = fs::read_to_string(result_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|result| {
+            result
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let text = super::diagnostics::component_test_failure_text(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+        result_error.as_deref(),
+        super::diagnostics::current_session_for_diagnostics().as_ref(),
+    );
+    log::error!("DualSense component test failed: {text}");
+    // Staging is deleted after a failed install; keep the log at the root.
+    #[cfg(not(test))]
+    super::diagnostics::persist_failure_log(&super::packages::component_root(), &text);
+    text
 }
 
 pub(crate) async fn has_active_session() -> bool {
@@ -354,6 +358,7 @@ pub(crate) fn local_uninstalled_status() -> DualSenseStatus {
         sidecar_path: sidecar_path().to_string_lossy().to_string(),
         driver_installed: false,
         usbip_available: false,
+        usbip_ready: false,
         usbip_version_valid,
         usbip_version,
         reboot_recommended: false,
@@ -362,6 +367,7 @@ pub(crate) fn local_uninstalled_status() -> DualSenseStatus {
         in_use: false,
         error_code,
         detail,
+        auto_update_detail: String::new(),
     }
 }
 
@@ -458,9 +464,11 @@ pub(crate) async fn dualsense_get_status_with_config(
         detail = "DS5-PROTO-001: the installed component metadata or capabilities do not match this Control Panel build".to_string();
     }
     if error_code.is_empty() && !usbip_error_code.is_empty() {
-        error_code = usbip_error_code;
+        error_code = usbip_error_code.clone();
         detail = usbip_detail;
     }
+    // A pending driver change is reported regardless of the component state.
+    let reboot_recommended = usbip_error_code == crate::usbip::USBIP_RESTART_CODE;
     let state = component_state(
         installed,
         verified,
@@ -492,13 +500,15 @@ pub(crate) async fn dualsense_get_status_with_config(
         sidecar_path: executable.to_string_lossy().to_string(),
         driver_installed: result.driver_installed,
         usbip_available,
+        usbip_ready,
         usbip_version,
         usbip_version_valid,
-        reboot_recommended: false,
+        reboot_recommended,
         standard_profile: result.standard,
         composite_profile: result.composite,
         in_use,
         error_code,
         detail,
+        auto_update_detail: super::auto_update::last_auto_update_issue(),
     })
 }

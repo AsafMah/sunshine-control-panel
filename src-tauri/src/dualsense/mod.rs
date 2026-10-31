@@ -14,6 +14,7 @@
 mod auto_update;
 mod commands;
 mod config;
+mod diagnostics;
 #[cfg(target_os = "windows")]
 mod elevated;
 mod install;
@@ -136,6 +137,9 @@ pub struct DualSenseStatus {
     pub sidecar_path: String,
     pub driver_installed: bool,
     pub usbip_available: bool,
+    /// Shared transport readiness on its own, independent of the component probe.
+    #[serde(default)]
+    pub usbip_ready: bool,
     pub usbip_version: String,
     pub usbip_version_valid: bool,
     pub reboot_recommended: bool,
@@ -144,6 +148,9 @@ pub struct DualSenseStatus {
     pub in_use: bool,
     pub error_code: String,
     pub detail: String,
+    /// Why the idle-time component update did not complete, if it did not.
+    #[serde(default)]
+    pub auto_update_detail: String,
 }
 
 #[derive(Debug, Serialize)]

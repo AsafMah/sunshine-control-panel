@@ -64,6 +64,19 @@
       show-icon
       @close="operationError = ''"
     />
+    <details v-if="operationDiagnostic" class="ds5-notice ds5-diagnostics">
+      <summary>{{ t.dualSense.technicalDiagnostics }}</summary>
+      <pre>{{ operationDiagnostic }}</pre>
+    </details>
+    <el-alert
+      v-if="autoUpdateIssue"
+      class="ds5-notice"
+      type="warning"
+      :title="t.dualSense.autoUpdateIssue"
+      :description="autoUpdateIssue"
+      :closable="false"
+      show-icon
+    />
 
     <section class="ds5-section">
       <el-collapse v-model="expandedSections" class="ds5-details-collapse">
@@ -105,7 +118,7 @@ const { component } = defineProps({
 })
 const {
   status, statusKnown, refreshing,
-  operation, operationProgress, operationStage, operationError,
+  operation, operationProgress, operationStage, operationError, operationDiagnostic, autoUpdateIssue,
   controlsBusy, componentAction, stateLabel, nextAction, overallVersion,
   showNotice, healthRows, safeStatusDetail, expandedSections,
   install, installFromPackage, refresh, uninstall,

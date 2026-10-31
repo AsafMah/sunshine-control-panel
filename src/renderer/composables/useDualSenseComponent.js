@@ -1,8 +1,8 @@
-import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { open } from '@tauri-apps/plugin-dialog'
 import { dualsense } from '../tauri-adapter.js'
-import { friendlyDualSenseError, safeDualSenseTechnicalError } from './dualsenseErrors.js'
+import { dualSenseDiagnosticDetail, friendlyDualSenseError, safeDualSenseTechnicalError } from './dualsenseErrors.js'
 import { dualSenseConfigReadable, mergeDualSenseStatus } from './dualsenseConfigSync.js'
 import { installSelectedDualSensePackages } from './dualsenseInstallFlow.js'
 import { dualSenseComponentAction, dualSenseComponentOperational, usbTransportPlan } from './deviceHubStatus.js'
@@ -22,6 +22,10 @@ export function useDualSenseComponent({ busy = ref(false), onStatus, afterInstal
   const operationProgress = ref(0)
   const operationStageKey = ref('preparing')
   const operationError = ref('')
+  const operationDiagnostic = ref('')
+  watch(operationError, (value) => {
+    if (!value) operationDiagnostic.value = ''
+  })
   const expandedSections = ref([])
   const rebootRecommended = ref(false)
   // 首次渲染前的占位默认值。字段必须与 Rust 侧 dualsense::probe::local_uninstalled_status()
@@ -31,12 +35,12 @@ export function useDualSenseComponent({ busy = ref(false), onStatus, afterInstal
     audio_haptics: false, genshin_compatibility: false,
     genshin_compatibility_available: false,
     component_version: '', available_component_version: '', update_available: false,
-    driver_installed: false, usbip_available: false, usbip_version: '',
+    driver_installed: false, usbip_available: false, usbip_ready: false, usbip_version: '',
     usbip_version_valid: false, reboot_recommended: false,
     standard_profile: false, composite_profile: false, in_use: false,
     legacy_strength: 1, legacy_curve: 0.5, legacy_noise_gate: 0.02,
     config_revision: 0, config_readable: false,
-    error_code: '', detail: '',
+    error_code: '', detail: '', auto_update_detail: '',
   })
   let pollTimer
   let unlistenProgress
@@ -81,8 +85,15 @@ export function useDualSenseComponent({ busy = ref(false), onStatus, afterInstal
     if (!status.value.usbip_version_valid) return t.value.dualSense.pinnedTransportRequired
     if (status.value.usbip_available) return `USB/IP ${status.value.usbip_version}`
     if (!status.value.installed) return t.value.dualSense.transportCheckPending
+    // The component probe gates usbip_available; report the transport's own
+    // state so an outdated component is not mistaken for a restart.
+    if (status.value.reboot_recommended) return t.value.dualSense.transportRestartRequired
+    if (status.value.usbip_ready) return t.value.dualSense.transportReadyComponentOutdated
     return t.value.dualSense.transportProbeFailed
   })
+  const autoUpdateIssue = computed(() => status.value.auto_update_detail
+    ? friendlyDualSenseError(status.value.auto_update_detail, t.value.dualSense.errors)
+    : '')
   const showNotice = computed(() => rebootRecommended.value || ['not_installed', 'repair_required', 'update_available', 'transport_missing', 'in_use'].includes(status.value.state))
   const healthRows = computed(() => [
     {
@@ -124,6 +135,7 @@ export function useDualSenseComponent({ busy = ref(false), onStatus, afterInstal
   /** Stores a sanitized diagnosis and displays contextual component or shared transport guidance. */
   const showError = (message, context = 'generic') => {
     operationError.value = safeDualSenseTechnicalError(message)
+    operationDiagnostic.value = dualSenseDiagnosticDetail(message)
     ElMessage.error(friendlyDualSenseError(message, t.value.dualSense.errors, context, t.value.deviceHub.usb.errors))
   }
 
@@ -378,7 +390,7 @@ export function useDualSenseComponent({ busy = ref(false), onStatus, afterInstal
 
   return {
     status, statusKnown, refreshing,
-    operation, operationProgress, operationStage, operationError,
+    operation, operationProgress, operationStage, operationError, operationDiagnostic, autoUpdateIssue,
     controlsBusy, componentControlsBusy, componentAction, componentOperational,
     stateLabel, nextAction, overallVersion, canTestAudioHaptics,
     showNotice, healthRows, safeStatusDetail, expandedSections,

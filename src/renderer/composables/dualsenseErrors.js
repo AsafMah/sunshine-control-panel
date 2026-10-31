@@ -3,6 +3,21 @@ const TECHNICAL_MESSAGE_PATTERN = /^((?:DS5|USBIP)-[A-Z]+-\d{3}:\s*[^:\r\n]+)/
 
 export const dualSenseErrorCode = (message) => String(message || '').match(CODE_PATTERN)?.[1] || ''
 
+// Backend failures append the full sidecar exception, stderr and exit code
+// after this marker (dualsense::diagnostics::DIAGNOSTIC_MARKER).
+const DIAGNOSTIC_MARKER = '\n\n--- diagnostics ---\n'
+const URL_PATTERN = /\bhttps?:\/\/\S+/gi
+
+/** Full technical text for an expandable details block, with URLs redacted. */
+export const dualSenseDiagnosticDetail = (message) => {
+  const text = String(message || '')
+  const index = text.indexOf(DIAGNOSTIC_MARKER)
+  if (index < 0) return ''
+  return `${text.slice(0, index)}\n\n${text.slice(index + DIAGNOSTIC_MARKER.length)}`
+    .replace(URL_PATTERN, '<url>')
+    .trim()
+}
+
 export const safeDualSenseTechnicalError = (message) =>
   String(message || '').match(TECHNICAL_MESSAGE_PATTERN)?.[1]
   || 'DualSense operation failed'
