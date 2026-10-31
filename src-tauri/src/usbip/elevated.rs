@@ -107,10 +107,12 @@ async fn run_elevated_helper(token: uuid::Uuid, request: ElevatedRequest) -> i32
                 let result = crate::dualsense::ensure_pinned_usbip(&progress, &root, None)
                     .await
                     .map_err(|error| format!("USBIP-SETUP-007: transport installation failed: {error}"))?;
+                // The installer's exit code misses services it reactivated
+                // from pending deletion; the restart detector does not.
                 let reboot_recommended = matches!(
                     result,
                     crate::dualsense::UsbipInstallResult::RebootRecommended
-                );
+                ) || super::restart::pending_restart().is_some();
                 Ok(ElevatedResponse {
                     success: true,
                     port: None,

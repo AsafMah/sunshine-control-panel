@@ -10,6 +10,7 @@ mod device;
 mod elevated;
 mod exec;
 mod manager;
+mod restart;
 mod status;
 
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,9 @@ struct ElevatedResponse {
 
 #[cfg(target_os = "windows")]
 pub(crate) use manager::uninstall_entries as usbip_uninstall_entries;
+#[cfg(target_os = "windows")]
+pub(crate) use restart::{record_live_pending_deletion, record_restart_required};
+pub(crate) use restart::RESTART_CODE as USBIP_RESTART_CODE;
 pub(crate) use manager::{
     INSTALLER_SHA256 as USBIP_SHA256, INSTALLER_URL as USBIP_URL, InstallDisposition,
     PINNED_VERSION as USBIP_VERSION, TRANSPORT_POLICY as USBIP_POLICY, install_disposition,

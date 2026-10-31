@@ -91,6 +91,23 @@ pub async fn usbip_get_status() -> Result<UsbipStatus, String> {
                 detail,
             });
         }
+        // A pending driver change makes the transport unusable even when
+        // usbip.exe still enumerates the old VHCI device.
+        if let Some(reason) = super::restart::pending_restart() {
+            let detail = super::restart::restart_detail(&reason);
+            return Ok(UsbipStatus {
+                supported: true,
+                installed: true,
+                ready: false,
+                version: installation.version,
+                version_valid,
+                reboot_recommended: true,
+                vhci_residual,
+                error_code: detail_error_code(&detail),
+                attached_devices: Vec::new(),
+                detail,
+            });
+        }
         match super::exec::list_attached().await {
             Ok(attached_devices) => Ok(UsbipStatus {
                 supported: true,
@@ -113,7 +130,7 @@ pub async fn usbip_get_status() -> Result<UsbipStatus, String> {
                 version: installation.version,
                 version_valid,
                 reboot_recommended: false,
-                vhci_residual,
+                vhci_residual: vhci_residual || reports_duplicate_vhci(&detail),
                 error_code: detail_error_code(&detail),
                 attached_devices: Vec::new(),
                 detail,
@@ -122,9 +139,27 @@ pub async fn usbip_get_status() -> Result<UsbipStatus, String> {
     }
 }
 
+/// usbip.exe's own verdict on duplicate VHCI interfaces. The interface
+/// enumeration can race device teardown, so trust this text as well and send
+/// the user to cleanup (which removes every VHCI devnode) instead of repair.
+pub(super) fn reports_duplicate_vhci(detail: &str) -> bool {
+    detail
+        .to_ascii_lowercase()
+        .contains("multiple instances of vhci device interface")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::detail_error_code;
+    use super::{detail_error_code, reports_duplicate_vhci};
+
+    #[test]
+    fn usbip_duplicate_vhci_verdict_routes_to_cleanup() {
+        // Pre-repair host message (2026-10-31), produced by exec::require_success.
+        let detail = "USBIP-EXEC-007: listing attached devices failed: error: Multiple instances of VHCI device interface found";
+        assert_eq!(detail_error_code(detail), "USBIP-EXEC-007");
+        assert!(reports_duplicate_vhci(detail));
+        assert!(!reports_duplicate_vhci("USBIP-EXEC-007: listing attached devices failed: access denied"));
+    }
 
     #[test]
     fn extracts_only_well_shaped_codes() {

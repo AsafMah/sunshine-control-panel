@@ -236,6 +236,10 @@ pub(super) async fn cleanup_broken_transport() -> Result<(), String> {
     remove_vhci_devnodes().await?;
     remove_orphaned_driver_service("usbip2_ude", "usbip2_ude.sys")?;
     remove_orphaned_driver_service("usbip2_filter", "usbip2_filter.sys")?;
+    // A vetoed removal (e.g. the filter still bound to a USB root hub) leaves
+    // the services pended for deletion. A reinstall would reactivate them and
+    // hide that, so record the pending restart now.
+    super::restart::record_live_pending_deletion();
     uninstall_error.map_or(Ok(()), Err)
 }
 
